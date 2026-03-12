@@ -1,0 +1,14 @@
+# Core browser automation
+selenium>=4.15.0
+
+# Stealth Chrome driver (bypasses bot detection)
+undetected-chromedriver>=3.5.0
+
+# CAPTCHA OCR engine
+ddddocr>=1.4.11
+
+# Image processing for CAPTCHA
+Pillow>=10.0.0
+
+# NTP time sync (precise tatkal countdown)
+ntplib>=0.4.0

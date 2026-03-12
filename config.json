@@ -1,0 +1,39 @@
+{
+    "========== IRCTC LOGIN (REQUIRED) ==========": "",
+    "irctc_username": "dasabhi356",
+    "irctc_password": "AbhiDas@9836",
+    "upi_id": "abhi01das@ybl",
+
+    "========== JOURNEY DETAILS (REQUIRED) ==========": "",
+    "from_station": "NDLS",
+    "to_station": "PNBE",
+    "journey_date": "25/03/2026",
+    "train_number": "12301",
+    "travel_class": "SL",
+    "booking_type": "TATKAL",
+    "_booking_type_options": "GENERAL | TATKAL",
+
+    "========== PASSENGER DETAILS (REQUIRED) ==========": "",
+    "passengers": [
+        {
+            "name": "Abhi Das",
+            "age": "30",
+            "gender": "Male",
+            "berth_preference": "Lower",
+            "food_choice": "No Food"
+        }
+    ],
+
+    "========== CONTACT INFO (REQUIRED) ==========": "",
+    "mobile_number": "9836567559",
+
+    "========== BOOKING OPTIONS ==========": "",
+    "auto_upgrade": true,
+    "travel_insurance": false,
+
+    "========== ADVANCED (DO NOT CHANGE) ==========": "",
+    "login_before_minutes": 10,
+    "captcha_max_retries": 10,
+    "headless": false,
+    "ntp_server": "time.google.com"
+}
