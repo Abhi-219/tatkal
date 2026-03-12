@@ -421,92 +421,359 @@ class TatkalBooker:
     # ------------------------------------------------------------ #
     #  STEP 3: Select train & class
     # ------------------------------------------------------------ #
+    def _wait_for_spinner_gone(self, timeout=10):
+        """Wait for any PrimeNG / IRCTC loading spinners to disappear."""
+        spinner_selectors = [
+            "div.spinner", "p-progressSpinner", ".ui-progress-spinner",
+            "div.loading", ".loader-overlay", "div.overlay",
+        ]
+        for sel in spinner_selectors:
+            try:
+                WebDriverWait(self.driver, 2).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                WebDriverWait(self.driver, timeout).until_not(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+            except TimeoutException:
+                pass
+            except Exception:
+                pass
+
+    def _find_train_row(self, train_no):
+        """Locate the train card/row element containing the given train number."""
+        # IRCTC nget wraps each train in div.bull-back inside app-train-avl-enq
+        row_selectors = [
+            "app-train-avl-enq div.bull-back",
+            "div.bull-back",
+            "app-train-avl-enq .form-group",
+            "div.train-list",
+        ]
+        for sel in row_selectors:
+            rows = self.driver.find_elements(By.CSS_SELECTOR, sel)
+            for row in rows:
+                try:
+                    if train_no in row.text:
+                        return row
+                except StaleElementReferenceException:
+                    continue
+        return None
+
+    def _click_class_tab(self, train_row, travel_class):
+        """Click the class availability tab (SL, 3A, 2A …) inside a train row."""
+        # Strategy 1: find <td class="pre-avl"> or <td> with <strong> matching
+        #             the class code inside that train row
+        class_tab_selectors = [
+            "td.pre-avl",             # standard class cells
+            "td.pre-avl strong",      # <strong> inside class cell
+            "div.pre-avl",            # alternate layout
+            "a.cls-name",             # link variant
+            "span.class-name",        # span variant
+            "strong",                 # any strong (filter by text below)
+        ]
+        for sel in class_tab_selectors:
+            tabs = train_row.find_elements(By.CSS_SELECTOR, sel)
+            for tab in tabs:
+                try:
+                    tab_text = tab.text.strip().upper()
+                    if travel_class.upper() in tab_text:
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});", tab)
+                        human_delay(150, 250)
+                        tab.click()
+                        logger.info(f"Clicked class tab: {travel_class}")
+                        return True
+                except (StaleElementReferenceException, ElementClickInterceptedException):
+                    continue
+
+        # Strategy 2: XPath scoped inside the train row
+        try:
+            tab = train_row.find_element(
+                By.XPATH,
+                f".//td[contains(@class,'pre-avl')]//strong[contains(translate(text(),"
+                f"'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{travel_class.upper()}')]"
+            )
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", tab)
+            human_delay(150, 250)
+            # Click the parent <td> – more reliable than clicking the <strong>
+            parent_td = tab.find_element(By.XPATH, "./ancestor::td[1]")
+            parent_td.click()
+            logger.info(f"Clicked class tab (XPath): {travel_class}")
+            return True
+        except Exception:
+            pass
+
+        # Strategy 3: JavaScript click on any element containing the class text
+        try:
+            tab = train_row.find_element(
+                By.XPATH,
+                f".//*[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz',"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{travel_class.upper()}')]"
+            )
+            self.driver.execute_script("arguments[0].click();", tab)
+            logger.info(f"Clicked class tab (JS): {travel_class}")
+            return True
+        except Exception:
+            pass
+
+        return False
+
+    def _wait_for_availability_data(self, timeout=15):
+        """Wait for the availability table/section to load after clicking a class."""
+        avail_selectors = [
+            # Table rows with availability data
+            "table.table tbody tr td",
+            # Availability status text
+            "div.pre-avl td.pre-avl",
+            # The entire availability container
+            "div.table-container",
+            # Any Book Now element appearing
+            "button.btnDefault.train_Search",
+            "td.book_link a",
+            "td.book_link button",
+        ]
+        for sel in avail_selectors:
+            try:
+                WebDriverWait(self.driver, timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                logger.info("Availability data loaded.")
+                return True
+            except TimeoutException:
+                continue
+
+        # Fallback: wait for any "Book Now" text to appear
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//*[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz',"
+                               "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BOOK NOW')]"))
+            )
+            logger.info("Availability data loaded (found Book Now text).")
+            return True
+        except TimeoutException:
+            logger.warning("Availability data may not have loaded yet.")
+            return False
+
+    def _click_book_now(self):
+        """
+        Click the 'Book Now' button in the expanded availability section.
+        Handles: <button>, <a>, and various class names IRCTC has used.
+        Targets the correct journey date row when multiple dates are shown.
+        """
+        journey_date = self.cfg.get("journey_date", "")
+        self._wait_for_spinner_gone()
+
+        # ── Strategy 1: Find Book Now in the row matching the journey date ──
+        if journey_date:
+            # Convert DD/MM/YYYY → possible display formats IRCTC uses
+            parts = journey_date.split("/")
+            if len(parts) == 3:
+                # IRCTC may display as "Wed, 25 Mar" or "25-03-2026" etc.
+                date_fragments = [
+                    parts[0],                              # "25"
+                    f"{parts[0]}-{parts[1]}",              # "25-03"
+                    f"{parts[0]}/{parts[1]}",              # "25/03"
+                ]
+            else:
+                date_fragments = [journey_date]
+
+            # Look for table rows containing the date, then find Book Now in same row
+            try:
+                avail_rows = self.driver.find_elements(
+                    By.CSS_SELECTOR, "table.table tbody tr, div.table-container tr"
+                )
+                for row in avail_rows:
+                    row_text = row.text
+                    date_match = any(frag in row_text for frag in date_fragments)
+                    if date_match:
+                        # Find Book Now inside this date row
+                        book_els = row.find_elements(
+                            By.XPATH,
+                            ".//button[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz',"
+                            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BOOK NOW')] | "
+                            ".//a[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz',"
+                            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BOOK NOW')] | "
+                            ".//button[contains(@class,'btnDefault')] | "
+                            ".//a[contains(@class,'book_link')]"
+                        )
+                        for el in book_els:
+                            if el.is_displayed() and el.is_enabled():
+                                self.driver.execute_script(
+                                    "arguments[0].scrollIntoView({block:'center'});", el)
+                                human_delay(200, 300)
+                                try:
+                                    el.click()
+                                    logger.info(f"Clicked Book Now for date row: {row_text[:40]}")
+                                    return True
+                                except ElementClickInterceptedException:
+                                    self.driver.execute_script("arguments[0].click();", el)
+                                    logger.info(f"Clicked Book Now (JS) for date: {row_text[:40]}")
+                                    return True
+            except Exception as e:
+                logger.debug(f"Date-targeted Book Now search failed: {e}")
+
+        # ── Strategy 2: Click first visible/enabled Book Now (any format) ──
+        book_now_xpaths = [
+            # <button> with text "Book Now"
+            "//button[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz',"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BOOK NOW')]",
+            # <a> with text "Book Now"
+            "//a[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz',"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BOOK NOW')]",
+            # <button> with class btnDefault (IRCTC's standard)
+            "//button[contains(@class,'btnDefault') and contains(@class,'train_Search')]",
+            # <td> with book_link class containing <a>
+            "//td[contains(@class,'book_link')]//a",
+            # Any input type submit with Book Now value
+            "//input[@type='submit' and contains(translate(@value,'abcdefghijklmnopqrstuvwxyz',"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'BOOK NOW')]",
+            # Link with book-btn class
+            "//a[contains(@class,'book-btn')]",
+        ]
+        for xpath in book_now_xpaths:
+            try:
+                elements = self.driver.find_elements(By.XPATH, xpath)
+                for el in elements:
+                    if el.is_displayed():
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});", el)
+                        human_delay(200, 300)
+                        try:
+                            el.click()
+                        except ElementClickInterceptedException:
+                            self.driver.execute_script("arguments[0].click();", el)
+                        logger.info(f"Clicked Book Now (strategy 2, xpath: {xpath[:50]}...)")
+                        return True
+            except Exception:
+                continue
+
+        # ── Strategy 3: CSS selector broad search ──
+        book_css_selectors = [
+            "button.btnDefault.train_Search",
+            "button.btnDefault",
+            "a.book_link",
+            "td.book_link a",
+            "td.book_link button",
+            ".btn.book-btn",
+        ]
+        for sel in book_css_selectors:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in elements:
+                    if el.is_displayed() and el.is_enabled():
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});", el)
+                        human_delay(200, 300)
+                        try:
+                            el.click()
+                        except ElementClickInterceptedException:
+                            self.driver.execute_script("arguments[0].click();", el)
+                        logger.info(f"Clicked Book Now (strategy 3, css: {sel})")
+                        return True
+            except Exception:
+                continue
+
+        return False
+
     def select_train(self):
         train_no = self.cfg["train_number"]
         travel_class = self.cfg["travel_class"]
         logger.info(f"Looking for train {train_no}, class {travel_class}...")
 
+        self._wait_for_spinner_gone()
         time.sleep(2)
+        self.dismiss_overlays()
 
-        # Find the train row
-        train_found = False
-        for attempt in range(3):
-            try:
-                train_rows = self.driver.find_elements(
-                    By.CSS_SELECTOR, "app-train-avl-enq .train-list, .bull-back"
-                )
-                for row in train_rows:
-                    if train_no in row.text:
-                        logger.info(f"Found train {train_no}")
-                        # Find the class button within this train
-                        class_buttons = row.find_elements(
-                            By.CSS_SELECTOR, f"td.pre-avl, button.btn, .cls-list a, strong"
-                        )
-                        for btn in class_buttons:
-                            if travel_class in btn.text.upper():
-                                self.driver.execute_script(
-                                    "arguments[0].scrollIntoView({block:'center'});", btn)
-                                human_delay(200, 300)
-                                btn.click()
-                                train_found = True
-                                break
+        # ── Phase 1: Find the train row ──
+        train_row = None
+        for attempt in range(5):
+            train_row = self._find_train_row(train_no)
+            if train_row:
+                logger.info(f"Found train {train_no} (attempt {attempt+1})")
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", train_row)
+                human_delay(300, 500)
+                break
+            logger.info(f"Train {train_no} not found yet (attempt {attempt+1}/5)...")
+            time.sleep(2)
 
-                        if not train_found:
-                            # Click on the train row itself and look for class
-                            row.click()
-                            time.sleep(1)
-                            class_btns = self.driver.find_elements(
-                                By.XPATH, f"//td[contains(text(),'{travel_class}')] | //strong[contains(text(),'{travel_class}')]"
-                            )
-                            for btn in class_btns:
-                                btn.click()
-                                train_found = True
-                                break
-                        break
+        if not train_row:
+            logger.error(f"Could not find train {train_no} in search results.")
+            logger.info("Please select the train manually in the browser.")
+            input("Press ENTER after selecting train and class, "
+                  "then click 'Check Availability'...")
 
-                if train_found:
+        # ── Phase 2: Click the class tab (SL, 3A, etc.) ──
+        class_clicked = False
+        if train_row:
+            for attempt in range(3):
+                class_clicked = self._click_class_tab(train_row, travel_class)
+                if class_clicked:
                     break
-                time.sleep(2)
-            except Exception as e:
-                logger.warning(f"Train selection attempt {attempt+1} failed: {e}")
-                time.sleep(2)
+                logger.warning(f"Class tab click attempt {attempt+1} failed, retrying...")
+                time.sleep(1)
+                # Re-find the train row (DOM may have re-rendered)
+                train_row = self._find_train_row(train_no)
+                if not train_row:
+                    break
 
-        if not train_found:
-            # Fallback: try XPath directly
+        if not class_clicked:
+            logger.warning(f"Could not auto-click class {travel_class}.")
+            logger.info("Please click the class tab manually in the browser.")
+            input("Press ENTER after clicking the class tab...")
+
+        # ── Phase 3: Wait for availability data to load ──
+        logger.info("Waiting for availability data to load...")
+        self._wait_for_availability_data(timeout=15)
+        self._wait_for_spinner_gone()
+        human_delay(500, 1000)
+
+        # ── Phase 4: Click "Book Now" ──
+        logger.info("Clicking Book Now...")
+        book_clicked = False
+        for attempt in range(3):
+            self.dismiss_overlays()
+            book_clicked = self._click_book_now()
+            if book_clicked:
+                break
+            logger.warning(f"Book Now click attempt {attempt+1} failed, retrying...")
+            time.sleep(2)
+
+        if not book_clicked:
+            logger.warning("Could not auto-click Book Now. Please click manually.")
+            input("Press ENTER after clicking Book Now...")
+
+        # ── Phase 5: Wait for page to transition to passenger form ──
+        logger.info("Waiting for passenger form to load...")
+        self._wait_for_spinner_gone(timeout=15)
+        passenger_loaded = False
+        passenger_page_selectors = [
+            "input[formcontrolname='passengerName']",
+            "app-passenger",
+            "div.passenger-form",
+            "input[formcontrolname='passengerAge']",
+            ".passenger-info",
+        ]
+        for sel in passenger_page_selectors:
             try:
-                self.safe_click(
-                    (By.XPATH, f"//*[contains(text(),'{train_no}')]/ancestor::*[contains(@class,'train')]//td[contains(text(),'{travel_class}')] | //*[contains(text(),'{train_no}')]/ancestor::*[contains(@class,'bull')]//strong[contains(text(),'{travel_class}')]"),
-                    timeout=10
+                WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
                 )
-                train_found = True
-            except Exception:
-                logger.error(f"Could not find train {train_no} with class {travel_class}")
-                logger.info("Please select the train manually in the browser.")
-                input("Press ENTER after selecting train and class...")
-                train_found = True
+                passenger_loaded = True
+                logger.info("✅ Passenger form loaded.")
+                break
+            except TimeoutException:
+                continue
+
+        if not passenger_loaded:
+            # Check if we're still on the same page (Book Now didn't work)
+            logger.warning("Passenger form not detected. The page may not have transitioned.")
+            logger.info("If still on train list, please click Book Now manually.")
+            input("Press ENTER when you see the passenger form...")
 
         time.sleep(2)
-
-        # Click "Book Now" button
-        logger.info("Clicking Book Now...")
-        try:
-            self.safe_click(
-                (By.XPATH, "//button[contains(text(),'Book Now')]"), timeout=10
-            )
-        except Exception:
-            try:
-                book_btns = self.driver.find_elements(
-                    By.XPATH, "//button[contains(@class,'book-btn')] | //button[contains(@class,'btnDefault')]"
-                )
-                for btn in book_btns:
-                    if "book" in btn.text.lower():
-                        btn.click()
-                        break
-            except Exception:
-                logger.warning("Could not auto-click Book Now. Please click manually.")
-                input("Press ENTER after clicking Book Now...")
-
-        time.sleep(3)
         self.dismiss_overlays()
 
     # ------------------------------------------------------------ #
